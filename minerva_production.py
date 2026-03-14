@@ -1,7 +1,6 @@
 import os
 import sqlite3
 import logging
-import asyncio
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import httpx
@@ -219,7 +218,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /start command."""
     user_id = update.effective_user.id
     
-    # Track user in database
     try:
         conn = sqlite3.connect('minerva_users.db')
         c = conn.cursor()
@@ -245,7 +243,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Message from {user_id}: {user_message[:50]}...")
     
-    # Check tier and enforce limits
     user_tier = get_user_tier(user_id)
     message_count = get_message_count(user_id)
     
@@ -268,7 +265,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Initialize history for new users
     if user_id not in conversation_histories:
         conversation_histories[user_id] = []
 
@@ -319,10 +315,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "content": minerva_response
         })
 
-        # Increment message count AFTER successful response
         increment_message_count(user_id)
 
-        # Add tier info for free users
         if user_tier == 'free':
             new_count = get_message_count(user_id)
             remaining = 5 - new_count
@@ -393,11 +387,10 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def main():
+def main():
     """Start the bot."""
     logger.info("Starting Minerva bot...")
     
-    # Verify environment variables
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN not set in .env")
         return
@@ -416,26 +409,8 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Minerva is awake.")
-    
-    # For Render: use webhook if WEBHOOK_URL is set, otherwise polling
-    webhook_url = os.getenv("WEBHOOK_URL")
-    port = int(os.getenv("PORT", 8080))
-    
-    if webhook_url:
-        logger.info(f"Starting with webhook on port {port}")
-        async with app:
-            await app.bot.set_webhook(url=f"{webhook_url}/webhook")
-            await app.start()
-            await app.updater.start_webhook(
-                listen="0.0.0.0",
-                port=port,
-                url_path="/webhook",
-                webhook_url=f"{webhook_url}/webhook"
-            )
-    else:
-        logger.info("Starting with polling")
-        app.run_polling()
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
