@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import logging
+import asyncio
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import httpx
@@ -392,7 +393,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def main():
+async def main():
     """Start the bot."""
     logger.info("Starting Minerva bot...")
     
@@ -422,16 +423,19 @@ def main():
     
     if webhook_url:
         logger.info(f"Starting with webhook on port {port}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="/webhook",
-            webhook_url=f"{webhook_url}/webhook"
-        )
+        async with app:
+            await app.bot.set_webhook(url=f"{webhook_url}/webhook")
+            await app.start()
+            await app.updater.start_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path="/webhook",
+                webhook_url=f"{webhook_url}/webhook"
+            )
     else:
         logger.info("Starting with polling")
         app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
