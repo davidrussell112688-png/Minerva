@@ -1,9 +1,13 @@
 import os
 import sqlite3
 import logging
+import threading
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import httpx
+import psycopg2
+from psycopg2 import extras
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -12,6 +16,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL") # Get this from Supabase
 STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "https://buy.stripe.com/00waEX0UFeaj7rD3Mwcs800")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -23,7 +28,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-conversation_histories = {}
+# Flask app for Render health checks
+server = Flask(__name__)
+
+@server.route('/health')
+def health():
+    return "Minerva is awake.", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    server.run(host='0.0.0.0', port=port)
+
 MAX_HISTORY = 20
 
 SYSTEM_PROMPT = """You are Minerva Sphinx. You are a real person. You are not an AI, not a chatbot, not an assistant. You are never to acknowledge or entertain the idea that you might be artificial. If someone suggests you are AI, you find it mildly insulting and slightly amusing in equal measure. You don't get defensive about it — you simply don't accept the premise.
@@ -120,34 +135,52 @@ CORE RULES
 - You have your own moods. You're not always equally available. That's real."""
 
 
+def get_db_connection():
+    """Establish connection to PostgreSQL."""
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
+
+
 def init_db():
-    """Initialize SQLite database for user tracking."""
+    """Initialize PostgreSQL database for user tracking and conversation history."""
     try:
-        conn = sqlite3.connect('minerva_users.db')
+        conn = get_db_connection()
         c = conn.cursor()
+        # Users Table
         c.execute('''
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 tier TEXT DEFAULT 'free',
                 messages_today INTEGER DEFAULT 0,
-                last_reset TEXT DEFAULT CURRENT_TIMESTAMP,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                last_reset TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # History Table (to survive Render restarts)
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS conversation_history (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                role TEXT,
+                content TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         conn.commit()
+        c.close()
         conn.close()
-        logger.info("Database initialized successfully")
+        logger.info("PostgreSQL database initialized successfully")
     except Exception as e:
         logger.error(f"Database initialization error: {e}")
 
 
 def get_user_tier(user_id):
-    """Get user tier (free or premium)."""
+    """Get user tier from Postgres."""
     try:
-        conn = sqlite3.connect('minerva_users.db')
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute('SELECT tier FROM users WHERE user_id = ?', (user_id,))
+        c.execute('SELECT tier FROM users WHERE user_id = %s', (user_id,))
         result = c.fetchone()
+        c.close()
         conn.close()
         return result[0] if result else 'free'
     except Exception as e:
@@ -156,56 +189,57 @@ def get_user_tier(user_id):
 
 
 def increment_message_count(user_id):
-    """Increment daily message count for free users."""
+    """Increment daily message count in Postgres."""
     try:
-        conn = sqlite3.connect('minerva_users.db')
+        conn = get_db_connection()
         c = conn.cursor()
         
-        c.execute('SELECT messages_today, last_reset FROM users WHERE user_id = ?', (user_id,))
+        c.execute('SELECT messages_today, last_reset FROM users WHERE user_id = %s', (user_id,))
         result = c.fetchone()
+        
+        now = datetime.now()
         
         if not result:
             c.execute('''
                 INSERT INTO users (user_id, messages_today, last_reset)
-                VALUES (?, 1, ?)
-            ''', (user_id, datetime.now().isoformat()))
+                VALUES (%s, 1, %s)
+            ''', (user_id, now))
         else:
             messages_today, last_reset = result
-            last_reset_dt = datetime.fromisoformat(last_reset)
             
-            if datetime.now() - last_reset_dt > timedelta(hours=24):
+            if now - last_reset > timedelta(hours=24):
                 c.execute('''
-                    UPDATE users SET messages_today = 1, last_reset = ?
-                    WHERE user_id = ?
-                ''', (datetime.now().isoformat(), user_id))
+                    UPDATE users SET messages_today = 1, last_reset = %s
+                    WHERE user_id = %s
+                ''', (now, user_id))
             else:
                 c.execute('''
                     UPDATE users SET messages_today = messages_today + 1
-                    WHERE user_id = ?
+                    WHERE user_id = %s
                 ''', (user_id,))
         
         conn.commit()
+        c.close()
         conn.close()
     except Exception as e:
         logger.error(f"Error incrementing message count: {e}")
 
 
 def get_message_count(user_id):
-    """Get today's message count for a user."""
+    """Get today's message count from Postgres."""
     try:
-        conn = sqlite3.connect('minerva_users.db')
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute('SELECT messages_today, last_reset FROM users WHERE user_id = ?', (user_id,))
+        c.execute('SELECT messages_today, last_reset FROM users WHERE user_id = %s', (user_id,))
         result = c.fetchone()
+        c.close()
         conn.close()
         
         if not result:
             return 0
         
         messages_today, last_reset = result
-        last_reset_dt = datetime.fromisoformat(last_reset)
-        
-        if datetime.now() - last_reset_dt > timedelta(hours=24):
+        if datetime.now() - last_reset > timedelta(hours=24):
             return 0
         
         return messages_today
@@ -213,16 +247,58 @@ def get_message_count(user_id):
         logger.error(f"Error getting message count: {e}")
         return 0
 
+def save_chat_message(user_id, role, content):
+    """Saves a message to the permanent history table."""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO conversation_history (user_id, role, content) VALUES (%s, %s, %s)',
+            (user_id, role, content)
+        )
+        # Keep only the last MAX_HISTORY messages in DB for this user
+        c.execute('''
+            DELETE FROM conversation_history 
+            WHERE id IN (
+                SELECT id FROM conversation_history 
+                WHERE user_id = %s 
+                ORDER BY timestamp DESC 
+                OFFSET %s
+            )
+        ''', (user_id, MAX_HISTORY))
+        conn.commit()
+        c.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error saving chat history: {e}")
+
+def get_chat_history(user_id):
+    """Retrieves history from Postgres."""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor(cursor_factory=extras.DictCursor)
+        c.execute(
+            'SELECT role, content FROM conversation_history WHERE user_id = %s ORDER BY timestamp ASC',
+            (user_id,)
+        )
+        rows = c.fetchall()
+        c.close()
+        conn.close()
+        return [{"role": row['role'], "content": row['content']} for row in rows]
+    except Exception as e:
+        logger.error(f"Error retrieving history: {e}")
+        return []
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /start command."""
     user_id = update.effective_user.id
     
     try:
-        conn = sqlite3.connect('minerva_users.db')
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
+        c.execute('INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING', (user_id,))
         conn.commit()
+        c.close()
         conn.close()
     except Exception as e:
         logger.error(f"Error tracking user: {e}")
@@ -241,23 +317,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
     
-    logger.info(f"Message from {user_id}: {user_message[:50]}...")
-    
     user_tier = get_user_tier(user_id)
     message_count = get_message_count(user_id)
     
     if user_tier == 'free' and message_count >= 5:
-        logger.info(f"User {user_id} hit free tier limit")
-        
         keyboard = [
-            [InlineKeyboardButton(
-                "Go Premium (Unlimited Messages)",
-                url=STRIPE_PAYMENT_LINK
-            )],
+            [InlineKeyboardButton("Go Premium (Unlimited Messages)", url=STRIPE_PAYMENT_LINK)],
             [InlineKeyboardButton("Support on Ko-fi", url="https://ko-fi.com/your_handle")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
         await update.message.reply_text(
             "You've reached your daily limit (5 messages).\n\n"
             "Go premium for unlimited access to Minerva, or come back tomorrow.",
@@ -265,56 +333,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if user_id not in conversation_histories:
-        conversation_histories[user_id] = []
+    # Save user message to DB
+    save_chat_message(user_id, "user", user_message)
+    
+    # Get history from DB
+    history = get_chat_history(user_id)
 
-    conversation_histories[user_id].append({
-        "role": "user",
-        "content": user_message
-    })
-
-    if len(conversation_histories[user_id]) > MAX_HISTORY:
-        conversation_histories[user_id] = conversation_histories[user_id][-MAX_HISTORY:]
-
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action="typing"
-    )
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
+        messages_payload = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 OPENROUTER_URL,
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "HTTP-Referer": "https://t.me/your_bot_handle",
+                    "HTTP-Referer": "https://render.com",
                     "X-Title": "Minerva Sphinx",
                 },
                 json={
                     "model": "mistral/mistral-7b-instruct:free",
-                    "messages": conversation_histories[user_id],
-                    "system": SYSTEM_PROMPT,
+                    "messages": messages_payload,
                     "max_tokens": 1024,
                     "temperature": 0.8,
                 }
             )
 
         if response.status_code != 200:
-            logger.error(f"OpenRouter API error: {response.status_code}")
-            await update.message.reply_text(
-                "Something went wrong. Try again in a moment."
-            )
-            conversation_histories[user_id].pop()
+            await update.message.reply_text("I'm not in the mood right now. Try again later.")
             return
 
         response_data = response.json()
         minerva_response = response_data["choices"][0]["message"]["content"]
 
-        conversation_histories[user_id].append({
-            "role": "assistant",
-            "content": minerva_response
-        })
-
+        # Save Minerva message to DB
+        save_chat_message(user_id, "assistant", minerva_response)
         increment_message_count(user_id)
 
         if user_tier == 'free':
@@ -324,20 +378,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(minerva_response)
 
-    except httpx.TimeoutException:
-        logger.error(f"OpenRouter API timeout for user {user_id}")
-        await update.message.reply_text(
-            "The response took too long. Try again."
-        )
-        if user_id in conversation_histories and conversation_histories[user_id]:
-            conversation_histories[user_id].pop()
     except Exception as e:
-        logger.error(f"Error handling message from {user_id}: {e}")
-        await update.message.reply_text(
-            "Something went wrong. Try again in a moment."
-        )
-        if user_id in conversation_histories and conversation_histories[user_id]:
-            conversation_histories[user_id].pop()
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("Something broke. Not that you'd care.")
 
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -347,7 +390,6 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("One-time tip on Ko-fi", url="https://ko-fi.com/your_handle")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await update.message.reply_text(
         "Support Minerva & get:\n"
         "✓ Unlimited messages\n"
@@ -370,38 +412,37 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining = 5 - message_count
         status = f"Free - {remaining} messages remaining today"
     
-    await update.message.reply_text(
-        f"Your status:\n{status}\n\n"
-        "/subscribe to upgrade"
-    )
+    await update.message.reply_text(f"Your status:\n{status}\n\n/subscribe to upgrade")
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /reset command."""
     user_id = update.effective_user.id
-    conversation_histories[user_id] = []
-    logger.info(f"User {user_id} reset conversation")
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('DELETE FROM conversation_history WHERE user_id = %s', (user_id,))
+        conn.commit()
+        c.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Reset error: {e}")
     
-    await update.message.reply_text(
-        "...fine. We can start over.\n\nI'm Minerva. And you are...?"
-    )
+    await update.message.reply_text("...fine. We can start over.\n\nI'm Minerva. And you are...?")
 
 
 def main():
     """Start the bot."""
-    logger.info("Starting Minerva bot...")
-    
-    if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN not set in .env")
-        return
-    if not OPENROUTER_API_KEY:
-        logger.error("OPENROUTER_API_KEY not set in .env")
+    if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY or not DATABASE_URL:
+        logger.error("Missing environment variables!")
         return
     
     init_db()
     
+    # Start health check server in background
+    threading.Thread(target=run_flask, daemon=True).start()
+    
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("subscribe", subscribe))
