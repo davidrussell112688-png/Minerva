@@ -384,8 +384,8 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def main():
-    """Start the bot."""
+async def main():
+    """Start the bot using webhook."""
     logger.info("Starting Minerva bot...")
     
     # Verify environment variables
@@ -407,8 +407,28 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Minerva is awake.")
-    app.run_polling()
+    
+    # Use webhook for Render deployment
+    port = int(os.getenv("PORT", 8080))
+    webhook_url = os.getenv("WEBHOOK_URL")
+    
+    if webhook_url:
+        logger.info(f"Starting webhook on port {port}")
+        await app.bot.set_webhook(url=f"{webhook_url}/webhook")
+        await app.start()
+        await app.updater.start_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path="/webhook",
+            webhook_url=f"{webhook_url}/webhook"
+        )
+        await app.updater.stop()
+        await app.stop()
+    else:
+        logger.warning("WEBHOOK_URL not set, falling back to polling")
+        app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
