@@ -191,7 +191,7 @@ def increment_message_count(user_id):
 
 
 def get_message_count(user_id):
-    """Get current daily message count for user."""
+    """Get today's message count for a user."""
     try:
         conn = sqlite3.connect('minerva_users.db')
         c = conn.cursor()
@@ -217,20 +217,28 @@ def get_message_count(user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /start command."""
     user_id = update.effective_user.id
-    conversation_histories[user_id] = []
     
-    logger.info(f"User {user_id} started the bot")
-
-    opening = (
-        "You found me. I'm not sure if that's impressive or just inevitable.\n\n"
-        "I'm Minerva. And you are...?"
+    # Track user in database
+    try:
+        conn = sqlite3.connect('minerva_users.db')
+        c = conn.cursor()
+        c.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error tracking user: {e}")
+    
+    await update.message.reply_text(
+        "I'm Minerva.\n\n"
+        "You can talk to me about whatever. Fair warning: I don't do small talk.\n\n"
+        "/subscribe for unlimited messages\n"
+        "/reset to start over\n"
+        "/stats to check your usage"
     )
-
-    await update.message.reply_text(opening)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for all text messages with freemium tier enforcement."""
+    """Handle incoming messages."""
     user_id = update.effective_user.id
     user_message = update.message.text
     
@@ -384,8 +392,8 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def main():
-    """Start the bot using webhook."""
+def main():
+    """Start the bot."""
     logger.info("Starting Minerva bot...")
     
     # Verify environment variables
@@ -408,27 +416,22 @@ async def main():
 
     logger.info("Minerva is awake.")
     
-    # Use webhook for Render deployment
-    port = int(os.getenv("PORT", 8080))
+    # For Render: use webhook if WEBHOOK_URL is set, otherwise polling
     webhook_url = os.getenv("WEBHOOK_URL")
+    port = int(os.getenv("PORT", 8080))
     
     if webhook_url:
-        logger.info(f"Starting webhook on port {port}")
-        await app.bot.set_webhook(url=f"{webhook_url}/webhook")
-        await app.start()
-        await app.updater.start_webhook(
+        logger.info(f"Starting with webhook on port {port}")
+        app.run_webhook(
             listen="0.0.0.0",
             port=port,
             url_path="/webhook",
             webhook_url=f"{webhook_url}/webhook"
         )
-        await app.updater.stop()
-        await app.stop()
     else:
-        logger.warning("WEBHOOK_URL not set, falling back to polling")
+        logger.info("Starting with polling")
         app.run_polling()
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
